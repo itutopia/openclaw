@@ -15,13 +15,13 @@ function json(data: unknown) {
 }
 
 /**
- * Convert a date string or timestamp to RFC3339 format
+ * Convert a date string or timestamp to Unix timestamp (seconds)
  * Supports: "2024-03-03", "2024-03-03 10:00", timestamp in ms
  */
-function toRFC3339(date: string | number, defaultHour = 9): string {
+function toTimestamp(date: string | number, defaultHour = 9): number {
   if (typeof date === "number") {
-    // Timestamp in milliseconds
-    return new Date(date).toISOString();
+    // Timestamp in milliseconds, convert to seconds
+    return Math.floor(date / 1000);
   }
 
   // Try to parse date string
@@ -32,7 +32,7 @@ function toRFC3339(date: string | number, defaultHour = 9): string {
     if (/^\d{4}-\d{2}-\d{2}$/.test(date)) {
       parsed.setHours(defaultHour, 0, 0, 0);
     }
-    return parsed.toISOString();
+    return Math.floor(parsed.getTime() / 1000);
   }
 
   throw new Error(`Invalid date format: ${date}`);
@@ -41,10 +41,8 @@ function toRFC3339(date: string | number, defaultHour = 9): string {
 /**
  * Calculate end time based on start time and duration
  */
-function calculateEndTime(startTime: string, durationMinutes: number): string {
-  const start = new Date(startTime);
-  const end = new Date(start.getTime() + durationMinutes * 60 * 1000);
-  return end.toISOString();
+function calculateEndTime(timestamp: number, durationMinutes: number): number {
+  return timestamp + durationMinutes * 60;
 }
 
 // ============ Schema ============
@@ -53,6 +51,7 @@ const FeishuCalendarSchema = Type.Object({
   action: Type.Union([
     Type.Literal("list_calendars"),
     Type.Literal("get_calendar"),
+    Type.Literal("get_primary_calendar"),
     Type.Literal("create_calendar"),
     Type.Literal("list_events"),
     Type.Literal("get_event"),
@@ -101,6 +100,23 @@ const FeishuCalendarSchema = Type.Object({
 type FeishuCalendarParams = Static<typeof FeishuCalendarSchema>;
 
 // ============ Calendar Actions ============
+
+async function getPrimaryCalendar(client: Lark.Client) {
+  const res = await client.calendar.calendar.primary({
+    data: {},
+  });
+  if (res.code !== 0) {
+    throw new Error(res.msg);
+  }
+
+  return {
+    calendar_id: res.data?.calendar?.calendar_id,
+    summary: res.data?.calendar?.summary,
+    description: res.data?.calendar?.description,
+    type: res.data?.calendar?.type,
+    permission: res.data?.calendar?.permission,
+  };
+}
 
 async function listCalendars(client: Lark.Client) {
   const res = await client.calendar.calendar.list({
@@ -231,13 +247,13 @@ async function createEvent(params: CreateEventParams) {
     attendeeIds,
   } = params;
 
-  const start = toRFC3339(startTime);
-  const end = endTime ? toRFC3339(endTime) : calculateEndTime(start, durationMinutes);
+  const start = toTimestamp(startTime);
+  const end = endTime ? toTimestamp(endTime) : calculateEndTime(start, durationMinutes);
 
   const eventData: Record<string, unknown> = {
     summary,
-    start_time: { date: start },
-    end_time: { date: end },
+    start_time: { timestamp: start },
+    end_time: { timestamp: end },
   };
 
   if (description) {
@@ -306,13 +322,13 @@ async function updateEvent(params: UpdateEventParams) {
   }
 
   if (startTime) {
-    const start = toRFC3339(startTime);
-    eventData.start_time = { date: start };
+    const start = toTimestamp(startTime);
+    eventData.start_time = { timestamp: start };
 
     if (endTime) {
-      eventData.end_time = { date: toRFC3339(endTime) };
+      eventData.end_time = { timestamp: toTimestamp(endTime) };
     } else if (durationMinutes) {
-      eventData.end_time = { date: calculateEndTime(start, durationMinutes) };
+      eventData.end_time = { timestamp: calculateEndTime(start, durationMinutes) };
     }
   }
 
@@ -389,7 +405,7 @@ export function registerFeishuCalendarTools(api: OpenClawPluginApi) {
       name: "feishu_calendar",
       label: "Feishu Calendar",
       description:
-        "Feishu calendar operations. Actions: list_calendars, get_calendar, create_calendar, list_events, get_event, create_event, update_event, delete_event",
+        "Feishu calendar operations. Actions: list_calendars, get_calendar, get_primary_calendar, create_calendar, list_events, get_event, create_event, update_event, delete_event",
       parameters: FeishuCalendarSchema,
       async execute(_toolCallId, params) {
         const p = params as FeishuCalendarParams;
@@ -404,6 +420,9 @@ export function registerFeishuCalendarTools(api: OpenClawPluginApi) {
             case "get_calendar":
               return json(await getCalendar(client, calendarId));
 
+            case "get_primary_calendar":
+              return json(await getPrimaryCalendar(client));
+
             case "create_calendar":
               if (!p.calendar_summary) {
                 return json({ error: "calendar_summary is required for create_calendar" });
@@ -411,10 +430,16 @@ export function registerFeishuCalendarTools(api: OpenClawPluginApi) {
               return json(await createCalendar(client, p.calendar_summary, p.calendar_description));
 
             case "list_events":
+              // If using default "primary", get the actual primary calendar ID first
+              let listCalendarId = calendarId;
+              if (calendarId === PRIMARY_CALENDAR_ID) {
+                const primaryCal = await getPrimaryCalendar(client);
+                listCalendarId = primaryCal.calendar_id;
+              }
               return json(
                 await listEvents(
                   client,
-                  calendarId,
+                  listCalendarId,
                   p.from_time,
                   p.to_time,
                   p.page_size,
@@ -432,10 +457,16 @@ export function registerFeishuCalendarTools(api: OpenClawPluginApi) {
               if (!p.summary || !p.start_time) {
                 return json({ error: "summary and start_time are required for create_event" });
               }
+              // If using default "primary", get the actual primary calendar ID first
+              let targetCalendarId = calendarId;
+              if (calendarId === PRIMARY_CALENDAR_ID) {
+                const primaryCal = await getPrimaryCalendar(client);
+                targetCalendarId = primaryCal.calendar_id;
+              }
               return json(
                 await createEvent({
                   client,
-                  calendarId,
+                  calendarId: targetCalendarId,
                   summary: p.summary,
                   startTime: p.start_time,
                   endTime: p.end_time,
